@@ -1,0 +1,3 @@
+controller,mean_return,mean_delay,mean_final_queue
+double_dqn,-1582.0558499999995,133427.8,1086.4
+fixed_time,-1651.7420749999997,140418.9,1129.7

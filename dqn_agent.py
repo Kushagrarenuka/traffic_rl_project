@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import deque
-from typing import Deque, Tuple
+from typing import Deque, Tuple, Optional
 import random
 
 import numpy as np
@@ -20,23 +20,23 @@ class DQNConfig:
 
     epsilon_start: float = 1.0
     epsilon_min: float = 0.05
-    epsilon_decay: float = 0.995  # applied per episode (simple + stable)
+    epsilon_decay: float = 0.985
 
     replay_capacity: int = 50_000
     batch_size: int = 64
-    train_start: int = 2_000  # don't train until buffer has this many transitions
+    train_start: int = 2_000
 
     target_update_every_steps: int = 1_000
+    use_double_dqn: bool = True
 
 
 class DQNAgent:
-    def __init__(self, state_size: int, action_size: int, cfg: DQNConfig | None = None) -> None:
+    def __init__(self, state_size: int, action_size: int, cfg: Optional[DQNConfig] = None) -> None:
         self.state_size = int(state_size)
         self.action_size = int(action_size)
         self.cfg = cfg or DQNConfig()
 
         self.memory: Deque[Transition] = deque(maxlen=self.cfg.replay_capacity)
-
         self.epsilon = self.cfg.epsilon_start
         self._train_step_counter = 0
 
@@ -59,56 +59,49 @@ class DQNAgent:
         )
         return model
 
-    def remember(self, state: np.ndarray, action: int, reward: float, next_state: np.ndarray, done: bool) -> None:
+    def remember(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ) -> None:
         self.memory.append((state, int(action), float(reward), next_state, bool(done)))
 
-    def act(self, state: np.ndarray) -> int:
-        """
-        Parameters
-        ----------
-        state : np.ndarray
-            Shape: (1, state_size)
-
-        Returns
-        -------
-        int
-            Action index.
-        """
-        if np.random.rand() < self.epsilon:
+    def act(self, state: np.ndarray, greedy: bool = False) -> int:
+        if (not greedy) and np.random.rand() < self.epsilon:
             return random.randrange(self.action_size)
 
         q_values = self.model.predict(state, verbose=0)
         return int(np.argmax(q_values[0]))
 
     def train_step(self) -> float | None:
-        """
-        Runs one gradient update from a replay minibatch.
-
-        Returns
-        -------
-        float | None
-            Training loss, or None if not enough data yet.
-        """
         if len(self.memory) < self.cfg.train_start:
             return None
 
         batch = random.sample(self.memory, self.cfg.batch_size)
 
-        states = np.vstack([b[0] for b in batch]).astype(np.float32)       # (B, state_size)
-        actions = np.array([b[1] for b in batch], dtype=np.int32)          # (B,)
-        rewards = np.array([b[2] for b in batch], dtype=np.float32)        # (B,)
-        next_states = np.vstack([b[3] for b in batch]).astype(np.float32)  # (B, state_size)
-        dones = np.array([b[4] for b in batch], dtype=np.float32)          # (B,)
+        states = np.vstack([b[0] for b in batch]).astype(np.float32)
+        actions = np.array([b[1] for b in batch], dtype=np.int32)
+        rewards = np.array([b[2] for b in batch], dtype=np.float32)
+        next_states = np.vstack([b[3] for b in batch]).astype(np.float32)
+        dones = np.array([b[4] for b in batch], dtype=np.float32)
 
-        # Current Q(s, a)
-        q_current = self.model.predict(states, verbose=0)                  # (B, A)
-
-        # Target: r + gamma * max_a' Q_target(s', a') if not done
-        q_next_target = self.target_model.predict(next_states, verbose=0)  # (B, A)
-        max_next = np.max(q_next_target, axis=1)                           # (B,)
-
+        q_current = self.model.predict(states, verbose=0)
         target = q_current.copy()
-        td_target = rewards + (1.0 - dones) * self.cfg.gamma * max_next
+
+        if self.cfg.use_double_dqn:
+            next_q_online = self.model.predict(next_states, verbose=0)
+            next_actions = np.argmax(next_q_online, axis=1)
+
+            next_q_target = self.target_model.predict(next_states, verbose=0)
+            next_values = next_q_target[np.arange(self.cfg.batch_size), next_actions]
+        else:
+            next_q_target = self.target_model.predict(next_states, verbose=0)
+            next_values = np.max(next_q_target, axis=1)
+
+        td_target = rewards + (1.0 - dones) * self.cfg.gamma * next_values
         target[np.arange(self.cfg.batch_size), actions] = td_target
 
         history = self.model.fit(states, target, epochs=1, verbose=0)
@@ -120,27 +113,18 @@ class DQNAgent:
 
         return loss
 
+    def end_episode(self) -> None:
+        self.epsilon = max(self.cfg.epsilon_min, self.epsilon * self.cfg.epsilon_decay)
+
     def update_target_network(self, hard: bool = True, tau: float = 1.0) -> None:
-        """
-        Parameters
-        ----------
-        hard : bool
-            If True, copy all weights.
-        tau : float
-            Soft update factor (only used when hard=False).
-        """
         if hard:
             self.target_model.set_weights(self.model.get_weights())
             return
 
-        # Soft update: target = tau * online + (1-tau) * target
         online = self.model.get_weights()
         target = self.target_model.get_weights()
         new_target = [tau * o + (1.0 - tau) * t for o, t in zip(online, target)]
         self.target_model.set_weights(new_target)
-
-    def end_episode(self) -> None:
-        self.epsilon = max(self.cfg.epsilon_min, self.epsilon * self.cfg.epsilon_decay)
 
     def save(self, path: str) -> None:
         self.model.save(path)
