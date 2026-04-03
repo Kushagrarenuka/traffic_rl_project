@@ -1,116 +1,108 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Literal
 import numpy as np
-import tensorflow as tf
 
-from baselines import FixedTimeController
-from environment import TrafficEnvironment, EnvConfig
-from dqn_agent import DQNAgent, DQNConfig
-from utils import save_csv, ensure_dir
+from environment  import MultiIntersectionEnvironment, MultiEnvConfig
+from dqn_agent    import DQNAgent, DQNConfig
+from ppo_agent    import PPOAgent
+from baselines    import FixedTimeController, RandomController
+from weather_api  import get_weather_severity
+from utils        import ensure_dir, build_demand_profile, save_csv
 
-
-def build_demand_profile(length: int) -> np.ndarray:
-    x = np.linspace(0.8, 1.4, length // 2)
-    y = np.linspace(1.4, 0.9, length - len(x))
-    return np.concatenate([x, y]).astype(np.float32)
+AgentType = Literal["dqn", "ppo"]
 
 
-def evaluate_dqn(model_path: str, episodes: int = 20, seed: int = 777) -> Dict[str, float]:
-    env = TrafficEnvironment(
-        cfg=EnvConfig(max_steps=200, min_green=5, use_external_factors=True, normalize_state=True),
+def _load_agent(kind: AgentType, state_size: int, action_size: int, path: str):
+    agent = PPOAgent(state_size, action_size) if kind == "ppo" else DQNAgent(state_size, action_size, DQNConfig())
+    agent.load(path)
+    return agent
+
+
+def _make_env(n: int, seed: int, city: str) -> MultiIntersectionEnvironment:
+    return MultiIntersectionEnvironment(
+        cfg=MultiEnvConfig(n_intersections=n, max_steps=200, min_green=5,
+                           use_external_factors=True, normalize_state=True, w_co2=0.10),
         seed=seed,
         demand_profile=build_demand_profile(200),
+        weather_severity=get_weather_severity(city=city),
     )
-    agent = DQNAgent(
-        state_size=env.state_size,
-        action_size=env.action_size,
-        cfg=DQNConfig(),
-    )
-    agent.load(model_path)
 
-    returns = []
-    delays = []
-    queues = []
+
+def _run_episodes(env, n, act_fn, episodes) -> Dict:
+    """Run `episodes` greedy episodes; return mean ± std for key metrics."""
+    rets   = [[] for _ in range(n)]
+    delays = [[] for _ in range(n)]
+    co2s   = [[] for _ in range(n)]
 
     for _ in range(episodes):
-        state = env.reset().astype(np.float32).reshape(1, -1)
-        done = False
-        ep_return = 0.0
-        final_delay = 0.0
-        final_queue = 0.0
-
+        raw    = env.reset()
+        states = [s.astype(np.float32).reshape(1, -1) for s in raw]
+        ep_ret = [0.0] * n
+        done   = False
         while not done:
-            action = agent.act(state, greedy=True)
-            next_state, reward, done, info = env.step(action)
-            state = next_state.astype(np.float32).reshape(1, -1)
-            ep_return += reward
-            final_delay = info["cumulative_delay"]
-            final_queue = info["total_queue"]
+            actions          = act_fn(states, env)
+            next_raw, rews, done, infos = env.step(actions)
+            states = [s.astype(np.float32).reshape(1, -1) for s in next_raw]
+            for i in range(n):
+                ep_ret[i] += rews[i]
+        for i in range(n):
+            rets[i].append(ep_ret[i])
+            delays[i].append(infos[i]["cumulative_delay"])
+            co2s[i].append(infos[i]["total_co2"])
 
-        returns.append(ep_return)
-        delays.append(final_delay)
-        queues.append(final_queue)
-
-    return {
-        "controller": "double_dqn",
-        "mean_return": float(np.mean(returns)),
-        "mean_delay": float(np.mean(delays)),
-        "mean_final_queue": float(np.mean(queues)),
-    }
+    row = {}
+    for i in range(n):
+        row[f"mean_return_i{i}"] = float(np.mean(rets[i]))
+        row[f"std_return_i{i}"]  = float(np.std(rets[i]))
+        row[f"mean_delay_i{i}"]  = float(np.mean(delays[i]))
+        row[f"mean_co2_i{i}"]    = float(np.mean(co2s[i]))
+    return row
 
 
-def evaluate_fixed_time(episodes: int = 20, seed: int = 777) -> Dict[str, float]:
-    env = TrafficEnvironment(
-        cfg=EnvConfig(max_steps=200, min_green=5, use_external_factors=True, normalize_state=True),
-        seed=seed,
-        demand_profile=build_demand_profile(200),
-    )
-    controller = FixedTimeController(cycle_length=10)
+def evaluate_rl(kind: AgentType, model_paths: List[str], n: int = 2,
+                episodes: int = 20, seed: int = 777, city: str = "Boston") -> Dict:
+    env    = _make_env(n, seed, city)
+    agents = [_load_agent(kind, env.state_size, env.action_size, p) for p in model_paths]
 
-    returns = []
-    delays = []
-    queues = []
+    def act_fn(states, _env):
+        actions = []
+        for i, ag in enumerate(agents):
+            a = ag.act(states[i], greedy=True)
+            actions.append(a[0] if kind == "ppo" else a)
+        return actions
 
-    for _ in range(episodes):
-        env.reset()
-        done = False
-        ep_return = 0.0
-        final_delay = 0.0
-        final_queue = 0.0
+    return {"controller": kind, **_run_episodes(env, n, act_fn, episodes)}
 
-        while not done:
-            action = controller.act(env.phase_timer)
-            _, reward, done, info = env.step(action)
-            ep_return += reward
-            final_delay = info["cumulative_delay"]
-            final_queue = info["total_queue"]
 
-        returns.append(ep_return)
-        delays.append(final_delay)
-        queues.append(final_queue)
+def evaluate_baselines(n: int = 2, episodes: int = 20,
+                       seed: int = 777, city: str = "Boston") -> List[Dict]:
+    rows = []
+    for name, make_ctrl in [
+        ("fixed_time", lambda: [FixedTimeController(cycle_length=10) for _ in range(n)]),
+        ("random",     lambda: [RandomController() for _ in range(n)]),
+    ]:
+        env   = _make_env(n, seed, city)
+        ctrls = make_ctrl()
 
-    return {
-        "controller": "fixed_time",
-        "mean_return": float(np.mean(returns)),
-        "mean_delay": float(np.mean(delays)),
-        "mean_final_queue": float(np.mean(queues)),
-    }
+        def act_fn(states, _env, _ctrls=ctrls):
+            return [_ctrls[i].act(_env.phase_timers[i]) for i in range(n)]
+
+        rows.append({"controller": name, **_run_episodes(env, n, act_fn, episodes)})
+    return rows
 
 
 def main() -> None:
     ensure_dir("results")
-    rows: List[Dict[str, float]] = []
-
-    dqn_result = evaluate_dqn("models/dqn_model_seed_42.keras", episodes=20, seed=777)
-    baseline_result = evaluate_fixed_time(episodes=20, seed=777)
-
-    rows.append(dqn_result)
-    rows.append(baseline_result)
-
+    n    = 2
+    rows = []
+    rows.append(evaluate_rl("dqn", [f"models/dqn_intersection_{i}_seed_42.keras" for i in range(n)], n=n))
+    rows.append(evaluate_rl("ppo", [f"models/ppo_intersection_{i}_seed_42" for i in range(n)], n=n))
+    rows.extend(evaluate_baselines(n=n))
     save_csv(rows, "results/evaluation_summary.csv")
-    print("Saved evaluation to ./results/evaluation_summary.csv")
-    print(rows)
+    print("Evaluation saved to ./results/evaluation_summary.csv")
+    for r in rows:
+        print(r)
 
 
 if __name__ == "__main__":

@@ -1,127 +1,157 @@
 from __future__ import annotations
 
-from typing import List, Dict
+import os
+from typing import Dict, List, Literal
 import numpy as np
 
-from environment import TrafficEnvironment, EnvConfig
-from dqn_agent import DQNAgent, DQNConfig
-from utils import ensure_dir, save_training_plot, save_csv
+from environment import MultiIntersectionEnvironment, MultiEnvConfig
+from dqn_agent  import DQNAgent, DQNConfig
+from ppo_agent  import PPOAgent, PPOConfig
+from weather_api import get_weather_severity
+from utils import ensure_dir, build_demand_profile, save_training_plot, save_csv
+
+AgentType = Literal["dqn", "ppo"]
 
 
-def build_demand_profile(length: int) -> np.ndarray:
-    x = np.linspace(0.8, 1.4, length // 2)
-    y = np.linspace(1.4, 0.9, length - len(x))
-    return np.concatenate([x, y]).astype(np.float32)
+def _make_agents(n: int, state_size: int, action_size: int, kind: AgentType):
+    """Instantiate one fresh agent per intersection."""
+    agents = []
+    for _ in range(n):
+        if kind == "ppo":
+            agents.append(PPOAgent(state_size=state_size, action_size=action_size))
+        else:
+            agents.append(DQNAgent(
+                state_size=state_size, action_size=action_size,
+                cfg=DQNConfig(
+                    gamma=0.99, learning_rate=1e-3,
+                    epsilon_start=1.0, epsilon_min=0.05, epsilon_decay=0.97,
+                    replay_capacity=50_000, batch_size=64, train_start=2_000,
+                    target_update_every_steps=1_000, use_double_dqn=True,
+                ),
+            ))
+    return agents
 
 
-def train_one_seed(seed: int, episodes: int = 100, results_dir: str = "results") -> Dict[str, float]:
+def train_multiagent(
+    seed: int,
+    n_intersections: int  = 2,
+    agent_type: AgentType = "dqn",
+    episodes: int         = 100,
+    results_dir: str      = "results",
+    city: str             = "Boston",
+) -> Dict:
+    """
+    Train one independent agent per intersection.
+
+    PROPOSAL alignments addressed here
+    -----------------------------------
+    - Multi-agent (n_intersections ≥ 2)
+    - Real OpenWeather API weather severity
+    - CO2 term active in MultiEnvConfig (w_co2=0.10)
+    - PPO as alternative to Double DQN
+    - BUG FIX: f-string was missing 'f' prefix in original train.py
+    """
     ensure_dir(results_dir)
+    ensure_dir("models")   # BUG FIX: original code would crash if models/ absent
 
-    env = TrafficEnvironment(
-        cfg=EnvConfig(
-            max_steps=200,
-            min_green=5,
-            reward_scale=0.01,
-            use_external_factors=True,
-            normalize_state=True,
+    # ── live weather ──────────────────────────────────────────────────────────
+    weather_sev = get_weather_severity(city=city)
+    print(f"[WeatherAPI] {city} severity = {weather_sev:.3f}")
+
+    env = MultiIntersectionEnvironment(
+        cfg=MultiEnvConfig(
+            n_intersections=n_intersections,
+            max_steps=200, min_green=5, reward_scale=0.01,
+            use_external_factors=True, normalize_state=True, w_co2=0.10,
         ),
         seed=seed,
         demand_profile=build_demand_profile(200),
+        weather_severity=weather_sev,
     )
 
-    agent = DQNAgent(
-        state_size=env.state_size,
-        action_size=env.action_size,
-        cfg=DQNConfig(
-            gamma=0.99,
-            learning_rate=1e-3,
-            epsilon_start=1.0,
-            epsilon_min=0.05,
-            epsilon_decay=0.97,
-            replay_capacity=50_000,
-            batch_size=64,
-            train_start=2_000,
-            target_update_every_steps=1_000,
-            use_double_dqn=True,
-        ),
-    )
+    agents = _make_agents(n_intersections, env.state_size, env.action_size, agent_type)
 
-    returns: List[float] = []
-    episode_rows: List[Dict[str, float]] = []
+    all_returns: List[List[float]] = [[] for _ in range(n_intersections)]
+    episode_rows: List[Dict]       = []
 
     for ep in range(1, episodes + 1):
-        state = env.reset().astype(np.float32).reshape(1, -1)
+        raw    = env.reset()
+        states = [s.astype(np.float32).reshape(1, -1) for s in raw]
+        ep_ret = [0.0] * n_intersections
+        ep_co2 = [0.0] * n_intersections
+        done   = False
 
-        ep_return = 0.0
-        losses = []
-        total_queue_last = 0.0
-        cumulative_delay_last = 0.0
-
-        done = False
         while not done:
-            action = agent.act(state)
-            next_state, reward, done, info = env.step(action)
-            next_state = next_state.astype(np.float32).reshape(1, -1)
+            actions, log_probs, values = [], [], []
+            for i, agent in enumerate(agents):
+                if agent_type == "ppo":
+                    a, lp, v = agent.act(states[i])
+                    log_probs.append(lp); values.append(v)
+                else:
+                    a = agent.act(states[i])
+                actions.append(a)
 
-            agent.remember(state, action, reward, next_state, done)
-            loss = agent.train_step()
+            next_raw, rewards, done, infos = env.step(actions)
+            nxt = [s.astype(np.float32).reshape(1, -1) for s in next_raw]
 
-            if loss is not None:
-                losses.append(loss)
+            for i, agent in enumerate(agents):
+                if agent_type == "ppo":
+                    agent.store(states[i], actions[i], rewards[i], values[i], log_probs[i], done)
+                else:
+                    agent.remember(states[i], actions[i], rewards[i], nxt[i], done)
+                    agent.train_step()
+                ep_ret[i] += rewards[i]
+                ep_co2[i] += infos[i]["co2_step"]
 
-            state = next_state
-            ep_return += reward
-            total_queue_last = info["total_queue"]
-            cumulative_delay_last = info["cumulative_delay"]
+            states = nxt
 
-        agent.end_episode()
-        avg_loss = float(np.mean(losses)) if losses else float("nan")
+        # ── end-of-episode ────────────────────────────────────────────────────
+        if agent_type == "ppo":
+            for agent in agents:
+                agent.train(last_value=0.0)
+        else:
+            for agent in agents:
+                agent.end_episode()
 
-        returns.append(ep_return)
-        row = {
-            "episode": float(ep),
-            "return": float(ep_return),
-            "avg_loss": avg_loss,
-            "epsilon": float(agent.epsilon),
-            "final_total_queue": float(total_queue_last),
-            "cumulative_delay": float(cumulative_delay_last),
-        }
+        for i in range(n_intersections):
+            all_returns[i].append(ep_ret[i])
+
+        mean_ret = float(np.mean(ep_ret))
+        row = {"episode": ep, "agent_type": agent_type, "mean_return": mean_ret,
+               "weather_severity": weather_sev,
+               **{f"return_i{i}": ep_ret[i] for i in range(n_intersections)},
+               **{f"co2_i{i}":    ep_co2[i]  for i in range(n_intersections)}}
         episode_rows.append(row)
+        print(f"Seed {seed} | Ep {ep:03d} | mean_ret={mean_ret:9.2f} | "
+              f"weather={weather_sev:.2f} | {agent_type.upper()}")
 
-        print(
-            f"Seed {seed} | Episode {ep:03d} | "
-            f"return={ep_return:10.2f} | "
-            f"epsilon={agent.epsilon:0.3f} | "
-            f"avg_loss={avg_loss:0.4f}"
-        )
+    # ── save ──────────────────────────────────────────────────────────────────
+    for i, agent in enumerate(agents):
+        # BUG FIX: added f-prefix (original was "models/dqn_model_seed_{seed}.keras" literally)
+        path = f"models/{agent_type}_intersection_{i}_seed_{seed}.keras" if agent_type == "dqn" else f"models/{agent_type}_intersection_{i}_seed_{seed}"
+        agent.save(path)
 
-    model_path = "models/dqn_model_seed_{seed}.keras"
-    plot_path = f"{results_dir}/training_curve_seed_{seed}.png"
-    csv_path = f"{results_dir}/training_metrics_seed_{seed}.csv"
+    for i in range(n_intersections):
+        save_training_plot(all_returns[i],
+                           f"{results_dir}/curve_{agent_type}_i{i}_seed_{seed}.png")
+    save_csv(episode_rows, f"{results_dir}/metrics_{agent_type}_seed_{seed}.csv")
 
-    agent.save(model_path)
-    save_training_plot(returns, plot_path)
-    save_csv(episode_rows, csv_path)
-
-    last_10_mean = float(np.mean(returns[-10:]))
-    return {
-        "seed": float(seed),
-        "last_10_return_mean": last_10_mean,
-        "best_return": float(np.max(returns)),
-        "final_return": float(returns[-1]),
-    }
+    return {"seed": seed, "agent_type": agent_type, "n_intersections": n_intersections,
+            **{f"last10_i{i}": float(np.mean(all_returns[i][-10:])) for i in range(n_intersections)}}
 
 
 def main() -> None:
-    seeds = [42, 123, 999]
-    summary_rows = []
-
-    for seed in seeds:
-        summary = train_one_seed(seed=seed, episodes=100, results_dir="results")
-        summary_rows.append(summary)
-
-    save_csv(summary_rows, "results/seed_summary.csv")
-    print("Saved results to ./results")
+    seeds   = [42, 123, 999]
+    summary = []
+    for kind in ("dqn", "ppo"):           # compare both agents  (proposal requirement)
+        for seed in seeds:
+            summary.append(train_multiagent(
+                seed=seed, n_intersections=2,   # change to 3 or 4 to scale up
+                agent_type=kind, episodes=100,
+                results_dir="results", city="Boston",
+            ))
+    save_csv(summary, "results/seed_summary.csv")
+    print("Done — results in ./results/")
 
 
 if __name__ == "__main__":
